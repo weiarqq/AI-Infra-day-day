@@ -1,94 +1,78 @@
-#include <algorithm>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
-#include <float.h>
-#include <mma.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <iostream>
 #include <vector>
 
-#include <torch/extension.h>
-#include <torch/types.h>
+// CUTLASS 核心头文件
+#include "cutlass/gemm/device/gemm.h"
+#include "cutlass/util/host_tensor.h"
+#include "cutlass/util/reference/host/gemm.h"
+#include "cutlass/util/tensor_view_io.h"
 
-#include "cublas_v2.h"
+// 定义矩阵维度
+int M = 512;
+int N = 512;
+int K = 512;
 
-void cublas_sgemm(float* A, float* B, float* C, size_t M, size_t N, size_t K)
+using ElementAccumulator = float;
+using ElementComputeEpilogue = float;
+
+using ElementInputA = cutlass::half_t;
+using ElementInputB = cutlass::half_t;
+using ElementOuputC = cutlass::half_t;
+
+using LayoutA = cutlass::layout::RowMajor;
+using LayoutB = cutlass::layout::RowMajor;
+using LayoutC = cutlass::layout::RowMajor;
+
+using Gemm = cutlass::gemm::device::Gemm<ElementInputA, LayoutA,
+    ElementInputB, LayoutB,
+    ElementOutputC, LayoutC,
+    ElementAccumulator,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80>;
+
+int main()
 {
-    cublasHandle_t handle = nullptr;
-    cublasCreate(&handle);
-    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+    const int M, N, K = 512, 512, 512;
+    int lda, ldb, ldc = K, N, N;
 
-    static float alpha = 1.0;
-    static float beta = 0.0;
+    ElementInputA* d_A;
+    ElementInputB* d_B;
+    ElementOutputC* d_C;
 
-    cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
-        N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT);
-}
-
-void cublas_sgemm_tf32(float* A, float* B, float* C, size_t M, size_t N,
-    size_t K)
-{
-    cublasHandle_t handle = nullptr;
-    cublasCreate(&handle);
-    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
-
-    static float alpha = 1.0;
-    static float beta = 0.0;
-
-    cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
-        N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-}
-
-#define STRINGFY(str) #str
-#define TORCH_BINDING_COMMON_EXTENSION(func) \
-    m.def(STRINGFY(func), &func, STRINGFY(func));
-
-#define CHECK_TORCH_TENSOR_DTYPE(T, th_type)                       \
-    if (((T).options().dtype() != (th_type))) {                    \
-        std::cout << "Tensor Info:" << (T).options() << std::endl; \
-        throw std::runtime_error("values must be " #th_type);      \
+    CUDA_CHECK(cudaMalloc(&d_A, M * K * sizeof(ElementInputA)));
+    CUDA_CHECK(cudaMalloc(&d_B, K * N * sizeof(ElementInputB)));
+    CUDA_CHECK(cudaMalloc(&d_C, M * N * sizeof(ElementOutputC)));
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    Gemm::Arguments args
+    {
+        { M, N, K },
+            { d_A, lda },
+            { d_B, ldb },
+            { d_C, ldc },
+            { d_C, ldc },
+        {
+            alpha, beta
+        }
+    }
+    Gemm gemm_op;
+    cutlass::Status status = gemm_op.can_implement(args);
+    if (status != cutlass::Status::kSuccess) {
+        std::cerr << "CUTLASS cannot implement this GEMM kernel." << std::endl;
+        return -1;
+    }
+    status = gemm_op(args);
+    if (status != cutlass::Status::kSuccess) {
+        std::cerr << "CUTLASS GEMM execution failed." << std::endl;
+        return -1;
     }
 
-#define CHECK_TORCH_TENSOR_SHAPE(T, S0, S1)                \
-    if (((T).size(0) != (S0)) || ((T).size(1) != (S1))) {  \
-        throw std::runtime_error("Tensor size mismatch!"); \
-    }
+    std::cout << "GEMM 成功运行 (手动指定 lda/ldb/ldc)" << std::endl;
 
-void sgemm_cublas(torch::Tensor a, torch::Tensor b, torch::Tensor c)
-{
-    CHECK_TORCH_TENSOR_DTYPE(a, torch::kFloat32)
-    CHECK_TORCH_TENSOR_DTYPE(b, torch::kFloat32)
-    CHECK_TORCH_TENSOR_DTYPE(c, torch::kFloat32)
-    const int M = a.size(0);
-    const int K = a.size(1);
-    const int N = b.size(1);
-    CHECK_TORCH_TENSOR_SHAPE(a, M, K)
-    CHECK_TORCH_TENSOR_SHAPE(b, K, N)
-    CHECK_TORCH_TENSOR_SHAPE(c, M, N)
+    // 释放
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
 
-    cublas_sgemm(reinterpret_cast<float*>(a.data_ptr()),
-        reinterpret_cast<float*>(b.data_ptr()),
-        reinterpret_cast<float*>(c.data_ptr()), M, N, K);
-}
-
-// cublas tensor op
-void sgemm_cublas_tf32(torch::Tensor a, torch::Tensor b, torch::Tensor c)
-{
-    CHECK_TORCH_TENSOR_DTYPE(a, torch::kFloat32)
-    CHECK_TORCH_TENSOR_DTYPE(b, torch::kFloat32)
-    CHECK_TORCH_TENSOR_DTYPE(c, torch::kFloat32)
-    const int M = a.size(0);
-    const int K = a.size(1);
-    const int N = b.size(1);
-    CHECK_TORCH_TENSOR_SHAPE(a, M, K)
-    CHECK_TORCH_TENSOR_SHAPE(b, K, N)
-    CHECK_TORCH_TENSOR_SHAPE(c, M, N)
-
-    cublas_sgemm_tf32(reinterpret_cast<float*>(a.data_ptr()),
-        reinterpret_cast<float*>(b.data_ptr()),
-        reinterpret_cast<float*>(c.data_ptr()), M, N, K);
+    return 0;
 }

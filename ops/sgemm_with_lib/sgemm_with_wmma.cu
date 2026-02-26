@@ -12,6 +12,28 @@
 
 using namespace nvcuda;
 
+template <const int WMMA_M = 16, const int WMMA_N = 16, const int WMMA_K = 16>
+__global__ void hgemm_wmma_base(half* A, half* B, half* C, int M, int N, int K)
+{
+    int NUM_K_SPLIT = div_ceil(K, WMMA_K);
+    int load_gemm_a = blockIdx.y * WMMA_M;
+    int load_gemm_b = blockIdx.x * WMMA_N;
+    if (load_gemm_a >= M && load_gemm_b >= N)
+        return;
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> B_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> C_frag;
+    wmma::fill_fragment(C_frag, 0.0);
+
+    for (int k = 0; k < NUM_K_SPLIT; k++) {
+        wmma::load_matrix_sync(A_frag, A[load_gemm_a], K);
+        wmma::load_matrix_sync(B_frag, B[load_gemm_b], N);
+        wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(C + load_gemm_a * N + load_gemm_b, C_frag, N, wmma::mem_row_major);
+}
+
 // m16n16k16 wmma  + tile MMA with smem,  A, B, C: all row_major.
 template <const int WMMA_M = 16, const int WMMA_N = 16, const int WMMA_K = 16,
     const int WMMA_TILE_M = 4, const int WMMA_TILE_N = 2,

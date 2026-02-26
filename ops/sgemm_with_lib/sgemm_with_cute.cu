@@ -31,6 +31,7 @@ __global__ void hgemm_mma_stages_block_swizzle_tn_cute_kernel(
     extern __shared__ T shm_data[];
 
     T* Ashm = shm_data;
+    // cute::cosize(SmemLayoutA {})计算 A在共享内存的偏移
     T* Bshm = shm_data + cute::cosize(SmemLayoutA {});
 
     // Initilize thread block
@@ -48,6 +49,7 @@ __global__ void hgemm_mma_stages_block_swizzle_tn_cute_kernel(
     Tensor D = make_tensor(make_gmem_ptr(Dptr), make_shape(m, n), make_stride(n, Int<1> {}));
 
     // slice the tensor to small one which is used for current thread block.
+    // tile 维度(BM, BK), 数据根据 tile 划分为(M/BM. K/BK), iy代表第几个tile 一个block处理一个 Tile，所以可以对应上
     Tensor gA = local_tile(A, make_tile(Int<BM> {}, Int<BK> {}), make_coord(iy, _)); // (BM, BK, num_tile_k)
     Tensor gB = local_tile(B, make_tile(Int<BN> {}, Int<BK> {}), make_coord(ix, _)); // (BN, BK, num_tile_k)
     Tensor gD = local_tile(D, make_tile(Int<BM> {}, Int<BN> {}), make_coord(iy, ix)); // (BM, BN)
@@ -58,39 +60,36 @@ __global__ void hgemm_mma_stages_block_swizzle_tn_cute_kernel(
 
     // dispatch TileA/TileB/TileC mma tensor into thread fragment via partition
     TiledMMA tiled_mma;
+    // 声明threadIdx.x负责的数据写入到gD的位置
+    // 在全局内存（或共享内存）的 $BM \times BN$ 大块中，标出当前线程最终要写回的那些点。
     auto thr_mma = tiled_mma.get_slice(threadIdx.x);
     auto tCgD = thr_mma.partition_C(gD); // (MMA,MMA_M, MMA_N)
 
+    // 这几行代码执行后，编译器会真的在当前线程的 寄存器堆（Register File） 里分配空间。
+    // gA(_, _, 0) 代表计算一个tile有多大
     auto tCrA = thr_mma.partition_fragment_A(gA(_, _, 0)); // (MMA, MMA_M, MMA_K)
     auto tCrB = thr_mma.partition_fragment_B(gB(_, _, 0)); // (MMA, MMA_N, MMA_K)
     auto tCrD = thr_mma.partition_fragment_C(gD); // (MMA, MMA_M, MMA_N)
     clear(tCrD);
 
     // from global memory to shared memory
+    // 从全局内存中搬运数据到共享内存，partition_S 是源内存， partition_D是目标内存
     G2SCopyA g2s_tiled_copy_a;
     auto g2s_thr_copy_a = g2s_tiled_copy_a.get_slice(idx);
     auto tAgA_copy = g2s_thr_copy_a.partition_S(gA); // (CPY, CPY_M, CPY_K, num_tile_k)
     auto tAsA_copy = g2s_thr_copy_a.partition_D(sA); // (CPY, CPY_M, CPY_K, kStage)
-#ifdef CUTE_HGEMM_DEBUG
-    if (thread0()) {
-        print("\npartition_S(tAgA_copy): \n");
-        print(tAgA_copy);
-        print("\n");
-        print("\nThrCopy(g2s_thr_copy_a): \n");
-        print(g2s_thr_copy_a);
-        print("\n");
-    }
-#endif
-
     G2SCopyB g2s_tiled_copy_b;
     auto g2s_thr_copy_b = g2s_tiled_copy_b.get_slice(idx);
     auto tBgB_copy = g2s_thr_copy_b.partition_S(gB); // (CPY, CPY_N, CPY_K, num_tile_k)
     auto tBsB_copy = g2s_thr_copy_b.partition_D(sB); // (CPY, CPY_N, CPY_K, kStage)
 
     // from shared memory to register, use tiled_mma to generate tiled_copy
+    // 从共享内存搬运数据到寄存器
     auto s2r_tiled_copy_a = make_tiled_copy_A(S2RCopyAtomA {}, tiled_mma);
     auto s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(idx);
     auto tAsA = s2r_thr_copy_a.partition_S(sA); // (CPY, CPY_M, CPY_K, kStage)
+    // retile_D 重新解释寄存器的布局（Layout），使其适配搬运指令
+    // retile_D作用：它把原本按照“计算需求”排列的寄存器索引（M, K 维度），重新映射成“搬运需求”的索引（Copy 维度）。
     auto tCrA_view = s2r_thr_copy_a.retile_D(tCrA); // (CPY, CPY_M, CPY_K)
 
     auto s2r_tiled_copy_b = make_tiled_copy_B(S2RCopyAtomB {}, tiled_mma);
@@ -107,10 +106,12 @@ __global__ void hgemm_mma_stages_block_swizzle_tn_cute_kernel(
 
 #pragma unroll
     for (int istage = 0; istage < kStage - 1; ++istage) {
+        // 从全局内存中搬运数据到共享内存
         cute::copy(g2s_tiled_copy_a, tAgA_copy(_, _, _, istage),
             tAsA_copy(_, _, _, istage));
         cute::copy(g2s_tiled_copy_b, tBgB_copy(_, _, _, istage),
             tBsB_copy(_, _, _, istage));
+        // 每执行一次，硬件内部的任务计数器就会增加。它标记了一批传输任务的终点。
         cp_async_fence();
 
         ++itile_to_read;
@@ -118,6 +119,7 @@ __global__ void hgemm_mma_stages_block_swizzle_tn_cute_kernel(
     }
 
     // wait one submitted gmem->smem done
+    // 它的意思是“请等待，直到剩下的待处理批次只剩下 N个。 配合 cp_async_fence, cp_async_fence记录有几个异步任务， cp_async_wait设置必须等到完成到还剩N个任务再往下执行
     cp_async_wait<kStage - 2>();
     __syncthreads();
 
@@ -232,29 +234,22 @@ void launch_hgemm_mma_stages_block_swizzle_tn_cute(T* a,
     // Define the smem layouts, Swizzle<3, 3, 3> and
     // Swizzle<2, 3, 3> will get the same results.
     // reference: https://zhuanlan.zhihu.com/p/671419093
-    using SmemLayoutAtom = decltype(composition(
-        Swizzle<3, 3, 3> {},
-        make_layout(make_shape(Int<8> {}, Int<BK> {}),
-            make_stride(Int<BK> {}, Int<1> {}))));
+    // Swizzle<3, 3, 3> 做了什么： 它通过位运算（通常是 XOR 异或）对地址进行变换。
+    // 第一个 3(B)：表示参与变换的位宽（Base）。
+    // 第二个 3(M)：表示变换的周期（Mask）。
+    // 第三个 3(S)：表示左移的位数（Shift）。 简单来说，它把原本在内存里“排成直线”的数据，变成了“交叉分布”。这样当你按列读的时候，原本会撞车的线程被散开到了不同的 Bank 上。
+
+    // 在 CuTe 中，composition(A, B) 的作用是**“把函数 B 的输出作为函数 A 的输入”**。
+    // decltype(...) 的意思就是：“编译器，你自己算一下后面这一坨表达式推导出来的类型是什么，然后把这个类型给 SmemLayoutAtom 变量。”
+    using SmemLayoutAtom
+        = decltype(composition(
+            Swizzle<3, 3, 3> {},
+            make_layout(make_shape(Int<8> {}, Int<BK> {}),
+                make_stride(Int<BK> {}, Int<1> {}))));
     using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtom {},
         make_shape(Int<BM> {}, Int<BK> {}, Int<KStage> {})));
     using SmemLayoutB = decltype(tile_to_shape(SmemLayoutAtom {},
         make_shape(Int<BN> {}, Int<BK> {}, Int<KStage> {}))); // (m,n) -> smem_idx
-#ifdef CUTE_HGEMM_DEBUG
-    print("SmemLayoutA: ");
-    print(SmemLayoutA {});
-    print("\n");
-    print("SmemLayoutB: ");
-    print(SmemLayoutB {});
-    print("\n");
-    print("SmemLayoutB: ");
-    print(SmemLayoutB {});
-    print("\n");
-    print("SmemLayoutAtom A&B Latex: \n");
-    print_latex(SmemLayoutAtom {});
-    print("\n");
-#endif
-
     // mma
     using mma_op = SM80_16x8x16_F16F16F16F16_TN;
     using mma_traits = MMA_Traits<mma_op>;
@@ -273,61 +268,26 @@ void launch_hgemm_mma_stages_block_swizzle_tn_cute(T* a,
     // TiledMMA, more values, Permutations(32,32,16)
     using MMA_P_T = Tile<Int<kMmaPM>, Int<kMmaPN>, Int<kMmaPK>>;
     using MMA = decltype(make_tiled_mma(mma_atom {}, MMA_EU_RepeatT {}, MMA_P_T {}));
-#ifdef CUTE_HGEMM_DEBUG
-    print("MMA: ");
-    print(MMA {});
-    print("\n");
-    print("MMA Latex: \n");
-    print_latex(MMA {});
-    print("\n");
-#endif
 
     // copy from global memory to shared memory
     using g2s_copy_op = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
     using g2s_copy_traits = Copy_Traits<g2s_copy_op>;
     using g2s_copy_atom = Copy_Atom<g2s_copy_traits, T>;
-    // Make TiledCopy according to ThrLayout and ValLayout.
-    // 32x4 threads, each thread load 1x8 values (128 bits) once ?
-    //   Produce a TiledCopy from logical thread and values layouts.
-    // The thread and value layouts map coordinates to thr_idx and val_idx.
-    //   The product of these layouts is taken to produce the TV layout and the Tiler.
-    // Useful when threads and values need very specific mappings onto coordinates
-    //   in the target tensors.
     using G2SCopyA = decltype(make_tiled_copy(g2s_copy_atom {},
         make_layout(make_shape(Int<32> {}, Int<4> {}), // Thr layout 32x4 k-major
             make_stride(Int<4> {}, Int<1> {})),
         make_layout(make_shape(Int<1> {}, Int<8> {})))); // Val layout 1x8
     using G2SCopyB = G2SCopyA;
-#ifdef CUTE_HGEMM_DEBUG
-    print("G2SCopyA: ");
-    print(G2SCopyA {});
-    print("\n");
-    print("G2SCopyB: ");
-    print(G2SCopyB {});
-    print("\n");
-    print("G2SCopyA Latex: \n");
-    print_latex(G2SCopyA {});
-    print("\n");
-    print("G2SCopyB Latex: \n");
-    print_latex(G2SCopyB {});
-    print("\n");
-#endif
-    // copy from shared memory to register
-    // use mma tiled ,so no tiled here
     using s2r_copy_op = SM75_U32x4_LDSM_N;
     using s2r_copy_traits = Copy_Traits<s2r_copy_op>;
     using s2r_copy_atom = Copy_Atom<s2r_copy_traits, T>;
     using S2RCopyAtomA = s2r_copy_atom;
     using S2RCopyAtomB = s2r_copy_atom;
 
-    // epilogue: register to global via shared memory
-    // Swizzle<3, 3, 3>=BxMxS=(2^3)*(2^3)*(2^3)=512 values=1024 bytes.
-    // reference: https://zhuanlan.zhihu.com/p/671419093
     using SmemLayoutAtomC = decltype(composition(
         Swizzle<3, 3, 3> {},
         make_layout(make_shape(Int<kMmaPM> {}, Int<kMmaPN> {}), // 32*32
             make_stride(Int<kMmaPN> {}, Int<1> {}))));
-    // kSmemLayoutCBatch=4, 32x32x4=4096 values=8192 bytes
     using SmemLayoutC = decltype(tile_to_shape(
         SmemLayoutAtomC {},
         make_shape(Int<kMmaPM> {}, Int<kMmaPN> {}, Int<kSmemLayoutCBatch> {})));
@@ -335,23 +295,6 @@ void launch_hgemm_mma_stages_block_swizzle_tn_cute(T* a,
     static_assert(
         size<0>(SmemLayoutA {}) * size<1>(SmemLayoutA {}) >= size(SmemLayoutC {}),
         "C shared memory request is large than A's one pipe");
-#ifdef CUTE_HGEMM_DEBUG
-    print(SmemLayoutC {});
-    print("\n");
-    static constexpr int tmp_sizeC = size(SmemLayoutC {});
-    static constexpr int tmp_sizeA_0 = size<0>(SmemLayoutA {});
-    static constexpr int tmp_sizeA_1 = size<1>(SmemLayoutA {});
-    static constexpr int tmp_sizeA = tmp_sizeA_0 * tmp_sizeA_1;
-    print("size SmemLayoutC: %d", tmp_sizeC);
-    print("\n");
-    print("size SmemLayoutA: %d", tmp_sizeA);
-    print("\n");
-    print("size 0 SmemLayoutA: %d", tmp_sizeA_0);
-    print("\n");
-    print("size 1 SmemLayoutA: %d", tmp_sizeA_1);
-    print("\n");
-#endif
-
     using R2SCopyAtomC = Copy_Atom<UniversalCopy<int>, T>;
 
     using S2GCopyAtomC = Copy_Atom<UniversalCopy<cute::uint128_t>, T>;
@@ -378,10 +321,6 @@ void launch_hgemm_mma_stages_block_swizzle_tn_cute(T* a,
     static constexpr int kShmSize = cute::max(shm_size_AB, shm_size_C) * sizeof(T);
 
     int shm_size = kShmSize;
-#ifdef CUTE_HGEMM_DEBUG
-    print("shm_size: %d bytes, shm_size_AB: %d bytes, shm_size_C: %d bytes\n",
-        shm_size, shm_size_AB * (int)sizeof(T), shm_size_C * (int)sizeof(T));
-#endif
 
     cudaFuncSetAttribute(
         hgemm_mma_stages_block_swizzle_tn_cute_kernel<
@@ -430,11 +369,7 @@ int main()
 {
     using T = cute::half_t;
     using namespace cute;
-#ifdef CUTE_HGEMM_DEBUG
-    const int test_num = 1;
-#else
     const int test_num = 64;
-#endif
     int M_list[test_num];
     int N_list[test_num];
     int K_list[test_num];
@@ -488,89 +423,3 @@ int main()
 
     return 0;
 }
-
-#else
-// build torch python binding
-
-#include <torch/extension.h>
-#include <torch/types.h>
-// --------------------- PyTorch bindings for custom kernel -----------------------
-#define STRINGFY(str) #str
-#define TORCH_BINDING_COMMON_EXTENSION(func) \
-    m.def(STRINGFY(func), &func, STRINGFY(func));
-
-#define CHECK_TORCH_TENSOR_DTYPE(T, th_type)                       \
-    if (((T).options().dtype() != (th_type))) {                    \
-        std::cout << "Tensor Info:" << (T).options() << std::endl; \
-        throw std::runtime_error("values must be " #th_type);      \
-    }
-
-#define CHECK_TORCH_TENSOR_SHAPE(T, S0, S1)                \
-    if (((T).size(0) != (S0)) || ((T).size(1) != (S1))) {  \
-        throw std::runtime_error("Tensor size mismatch!"); \
-    }
-
-#define LAUNCH_HGEMM_MMA_STAGES_CUTE_NO_SWIZZLE_TN(stages) \
-    launch_hgemm_mma_stages_block_swizzle_tn_cute<         \
-        half, (stages), false>(                            \
-        reinterpret_cast<half*>(a.data_ptr()),             \
-        reinterpret_cast<half*>(b.data_ptr()),             \
-        reinterpret_cast<half*>(c.data_ptr()),             \
-        M, N, K, 2048);
-
-#define LAUNCH_HGEMM_MMA_STAGES_CUTE_SWIZZLE_TN(stages, stride) \
-    launch_hgemm_mma_stages_block_swizzle_tn_cute<              \
-        half, (stages), true>(                                  \
-        reinterpret_cast<half*>(a.data_ptr()),                  \
-        reinterpret_cast<half*>(b.data_ptr()),                  \
-        reinterpret_cast<half*>(c.data_ptr()),                  \
-        M, N, K, (stride));
-
-// Multi stages CuTe HGEMM with SMEM Swizzle and Block Swizzle.
-void hgemm_mma_stages_block_swizzle_tn_cute(
-    torch::Tensor a, torch::Tensor b, torch::Tensor c,
-    int stages, bool swizzle, int swizzle_stride)
-{
-    CHECK_TORCH_TENSOR_DTYPE(a, torch::kHalf)
-    CHECK_TORCH_TENSOR_DTYPE(b, torch::kHalf)
-    CHECK_TORCH_TENSOR_DTYPE(c, torch::kHalf)
-    const int M = a.size(0);
-    const int K = a.size(1);
-    const int N = b.size(1);
-    CHECK_TORCH_TENSOR_SHAPE(a, M, K)
-    CHECK_TORCH_TENSOR_SHAPE(b, K, N)
-    CHECK_TORCH_TENSOR_SHAPE(c, M, N)
-
-    if (swizzle) {
-        switch (stages) {
-        case 2:
-            LAUNCH_HGEMM_MMA_STAGES_CUTE_SWIZZLE_TN(2, swizzle_stride);
-            break;
-        case 3:
-            LAUNCH_HGEMM_MMA_STAGES_CUTE_SWIZZLE_TN(3, swizzle_stride);
-            break;
-        case 4:
-            LAUNCH_HGEMM_MMA_STAGES_CUTE_SWIZZLE_TN(4, swizzle_stride);
-            break;
-        default:
-            LAUNCH_HGEMM_MMA_STAGES_CUTE_SWIZZLE_TN(2, swizzle_stride);
-            break;
-        }
-    } else {
-        switch (stages) {
-        case 2:
-            LAUNCH_HGEMM_MMA_STAGES_CUTE_NO_SWIZZLE_TN(2)
-            break;
-        case 3:
-            LAUNCH_HGEMM_MMA_STAGES_CUTE_NO_SWIZZLE_TN(3)
-            break;
-        case 4:
-            LAUNCH_HGEMM_MMA_STAGES_CUTE_NO_SWIZZLE_TN(4)
-            break;
-        default:
-            LAUNCH_HGEMM_MMA_STAGES_CUTE_NO_SWIZZLE_TN(2)
-            break;
-        }
-    }
-}
-#endif

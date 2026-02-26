@@ -1,5 +1,6 @@
 #include "cublas_v2.h"
 #include <algorithm>
+#include <cstddef>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -11,6 +12,24 @@
 #include <vector>
 
 static cublasHandle_t g_handle = nullptr;
+
+void sgemm_blas_base(half* A, half* B, half, *C, size_t M, size_t, N, sizt_t, K)
+{
+    cublasHandle_t handle = nullptr_t;
+    cublasStatus_t status = cublasCreate(&handle);
+    status = cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
+
+    static half alpha = 1.0f;
+    static half beta = 0.0f;
+
+    cublasGemmEx(handle,
+        CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+        B, CUDA_R_16F, N,
+        A, CUDA_R_16F, K,
+        &beta,
+        C, CUDA_R_16F, N,
+        CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP)
+}
 
 void init_cublas_handle()
 {

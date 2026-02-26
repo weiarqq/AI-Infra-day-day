@@ -21,6 +21,20 @@
             printf("%s %d CUDA: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
     }
 
+__device__ __forceinline__ mma_base(float* d, uint32_t* a, uint32_t* b, float* c)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.fp32.fp16.fp16.fp32 
+        { % 0, % 1, % 2, % 3, % 4, % 5, % 6, % 7 },
+        { % 8, % 9, % 10, % 11 },
+        { % 12, % 13 },
+        { % 14, % 15, % 16, % 17, % 18, % 19, % 20, % 21 };
+        "
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3]), "=f"(d[4]), "=f"(d[5]), "=f"(d[6]), "=f"(d[7])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+        "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]), "f"(c[4]), "f"(c[5]), "f"(c[6]), "f"(c[7]));
+}
+
 // K: ldA
 // N: ldB
 template <
