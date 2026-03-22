@@ -245,7 +245,7 @@ void launch_hgemm_mma_stages_block_swizzle_tn_cute(T* a,
         = decltype(composition(
             Swizzle<3, 3, 3> {},
             make_layout(make_shape(Int<8> {}, Int<BK> {}),
-                make_stride(Int<BK> {}, Int<1> {}))));
+            make_stride(Int<BK> {}, Int<1> {}))));
     using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtom {},
         make_shape(Int<BM> {}, Int<BK> {}, Int<KStage> {})));
     using SmemLayoutB = decltype(tile_to_shape(SmemLayoutAtom {},
