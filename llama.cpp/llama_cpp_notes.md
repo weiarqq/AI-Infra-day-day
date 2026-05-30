@@ -60,3 +60,49 @@
 | **CANN** | 华为昇腾 | 国产算力 | **AscendCL**, NPU 算子 | 华为 CANN 软件栈 | 昇腾 310/910 算力机房、国产国产化替代项目 |
 | **BLAS** | 通用 CPU | 基础/辅助 | **OpenBLAS**, Intel MKL, Accelerate | 对应的数学库 (.lib / .so) | 纯 CPU 环境或需要极高精度的非量化任务 |
 | **KleidiAI** | Arm64 | 移动/服务器 | **NEON**, SVE / SVE2 优化 | Arm KleidiAI 库集成 | 现代 Android 旗舰手机 (骁龙/天玑) 及 Arm 服务器 |
+
+
+
+
+
+
+
+
+
+## 性能分析工具
+
+
+
+
+
+ #### btop
+
+支持：
+
+- CPU / 内存 / 磁盘 / 网络 全部可视化
+- 流畅动画 UI（非常接近 nvtop 风格）
+- 每核使用率 + 进程详细信息
+
+安装：
+
+```shell
+sudo apt install btop
+```
+
+
+
+![btop](/Users/wangqi/workspace/workspace/AI-Infra-day-day/llama.cpp/images/btops.jpg)
+
+
+
+
+
+
+
+
+
+
+
+
+
+Llama-simple

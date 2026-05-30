@@ -1,6 +1,38 @@
 
 
+
+
+
+
+
+
+
+
+
+
+## ggml对象
+
+
+
+ggml_tallocr
+
+
+
+
+
+ggml_backend
+
+
+
 ### ggml 属性
+
+
+
+
+
+
+
+
 
 #### ggml_type
 
@@ -373,7 +405,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
 
 
 
-
+ggml_tallocr
 
 ggml.c#line1520ggml_init
 
