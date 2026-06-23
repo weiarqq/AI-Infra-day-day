@@ -234,10 +234,10 @@ ESIMD_INLINE void gemm_q41weights_xmx16(fp16 *inputs, uint8_t *weights, fp16 *sc
 		
     // 输入已经被预先 shuffle 成适合 XMX 的 layout。这里每个 vv 负责 64 token，对应 vv * 64 * 16 的偏移。
     // 16 代表shuffle_input 里的 内层维度 [token0-256][channel0-16]
-    uint32_t localOffsetInput = globalOffsetInput + vv * 64 * 16;
-    uint32_t localOffsetWeight = globalOffsetWeight/2 + hh * 32 * 16;
+    uint32_t localOffsetInput = globalOffsetInput + vv * 64 * 16; // 一组 64个token，每个token有16个channels
+    // uint32_t localOffsetWeight = globalOffsetWeight/2 + hh * 32 * 16;
   	// 权重矩阵的输出通道坐标。当前 group 是 h * 256，当前线程负责其中 hh * 32。
-    uint32_t localOffsetWeightY = h *256 + hh * 32;
+    uint32_t localOffsetWeightY = h * 256 + hh * 32;
     // 权重矩阵输入通道方向坐标，从 0 开始，每轮增加 4 个 uint32_t 单位，对应 32 个 4-bit 权重块。
     uint32_t localOffsetWeightX = 0;
     
@@ -327,6 +327,8 @@ ESIMD_INLINE void gemm_q41weights_xmx16(fp16 *inputs, uint8_t *weights, fp16 *sc
 // 预加载第一批输入 A。
 // 一次加载 8 组，每组 128 个 fp16。
 // 这些对应当前线程负责的 64 token 区域。 128*8/16 = 64
+// t0[c0-c15] t1[c0-c15]..t255[c0-c15] 
+// 128/16 = 8 所以 ADataN_tik 一次有8个token,一共8个 ADataN_tik 共64个token
     AData0_tik = block_load<fp16, 128>(inputs + localOffsetInput + 128 * 0);
     AData1_tik = block_load<fp16, 128>(inputs + localOffsetInput + 128 * 1);
     AData2_tik = block_load<fp16, 128>(inputs + localOffsetInput + 128 * 2);
@@ -341,6 +343,22 @@ ESIMD_INLINE void gemm_q41weights_xmx16(fp16 *inputs, uint8_t *weights, fp16 *sc
 // 因为每个 uint32_t 是 4 bytes，所以总共：
 // 4 * 32 * 4 = 512 bytes
 // 这些 bytes 里面每个 byte 有两个 4-bit 权重。
+// bit_cast_view<T>() 的意思是：不改变底层 bits，只换一种类型视角来看同一段 SIMD 数据。
+  
+// typedef struct {
+//     union {
+//         struct {
+//             sycl::half d;  // delta
+//             sycl::half m;  // min
+//         };
+
+//         uint32_t dm;
+//     };
+
+//     uint8_t qs[32 / 2];  // nibbles / quants for 32 elements
+// } block_q4_1_32;
+
+// uint8_t qs[16] => uint32_t qs[4] 所以 一次读取 32行，一行一个block_q4_1 
     BData.bit_cast_view<uint32_t>() = load_2d<uint32_t, 4, 32, 1, true, false>((uint32_t *)weights, input_len/2 - 1, output_len -1, input_len/2 - 1, localOffsetWeightX, localOffsetWeightY);
   
 // 加载当前 32 个输出通道对应的 scale 和 zero-point。
@@ -375,7 +393,7 @@ ESIMD_INLINE void gemm_q41weights_xmx16(fp16 *inputs, uint8_t *weights, fp16 *sc
 // scaleOffset += 32，scale/zp 前进到下一组 K block。
     localOffsetInput += 16 * 256;
     localOffsetWeightX += 4;
-    scaleOffset += 32;
+    scaleOffset += 32; // 32 是因为 output channel 方向 移动32步，input channel还是1
 
 // 提取每个 byte 的低 4-bit 权重。
 // 低 nibble：
@@ -823,3 +841,232 @@ output_index =
   + token_inside_16    * 16
   + channel_inside_16;
 这个公式就是 shuffle_input_quater 输出布局的完整一维表达。
+
+```c++
+for token_256_block in 0..3:
+  for channel_4096_block in 0..1:
+    for channel_64_block in 0..63:
+      for channel_16_group in 0..3:
+        for token_16_block in 0..15:
+          for token_inside_16 in 0..15:
+            for channel_inside_16 in 0..15:
+              store input[token][channel] / 4
+```
+
+
+
+
+
+
+
+```c++
+BData.bit_cast_view<uint32_t>() = load_2d<uint32_t, 4, 32, 1, true, false>((uint32_t *)weights, input_len/2 - 1, output_len -1, input_len/2 - 1, localOffsetWeightX, localOffsetWeightY);  详细解释一下 这行的具体参数 以及实现的功能
+
+```
+这行是在从 weights 里按 2D tile 方式加载一块 Q4 weight 数据，并放进 BData：
+BData.bit_cast_view<uint32_t>() =
+    load_2d<uint32_t, 4, 32, 1, true, false>(
+        (uint32_t *)weights,
+        input_len/2 - 1,
+        output_len - 1,
+        input_len/2 - 1,
+        localOffsetWeightX,
+        localOffsetWeightY);
+可以拆成两部分看。
+左边
+BData.bit_cast_view<uint32_t>()
+BData 定义是：
+simd<uint8_t, 512> BData;
+也就是 512 bytes。
+但 load_2d<uint32_t, 4, 32, 1, ...> 返回的是：
+4 * 32 * 1 = 128 个 uint32_t
+总大小：
+128 * 4 bytes = 512 bytes
+所以这里用 bit_cast_view<uint32_t>() 把 BData 临时看成 simd<uint32_t, 128>，正好接住这次 2D load 的结果。
+模板参数
+load_2d<uint32_t, 4, 32, 1, true, false>
+含义大致是：
+T = uint32_t
+BlockWidth = 4
+BlockHeight = 32
+NBlocks = 1
+Transpose = true
+Transform = false
+也就是从二维内存中加载：
+32 行，每行 4 个 uint32_t
+原始数据量：
+32 * 4 * 4 bytes = 512 bytes
+这对应 Q4 weight 的一块：
+32 output channels x 32 input-K values
+因为 Q4 是 4bit，一个 byte 存两个 weight，所以：
+32 K values = 16 bytes = 4 uint32_t
+因此每个 output channel 一行，需要读 4 个 uint32_t。
+运行时参数
+(uint32_t *)weights
+把 weight buffer 当成 uint32_t* 读。不是改变数据，只是为了按 32-bit 粒度 load。
+input_len/2 - 1
+二维 surface 的宽度减 1。因为 Q4 weight 每个 K 只占 4bit，所以一行的 byte 数是：
+input_len / 2
+output_len - 1
+二维 surface 的高度减 1。weight 矩阵高度是 output channel 数。
+input_len/2 - 1
+二维 surface 的 pitch 减 1，也就是每一行之间的跨度。这里 weight 是紧密排布的，所以 pitch 等于 width：
+每个 output channel 占 input_len / 2 bytes
+localOffsetWeightX
+当前 K 方向的偏移。初始化是：
+uint32_t localOffsetWeightX = 0;
+每轮 K loop 后：
+localOffsetWeightX += 4;
+因为每轮处理 32 个 Q4 K：
+32 q4 values = 16 bytes = 4 uint32_t
+所以每次向右移动 4 个 uint32_t。
+localOffsetWeightY
+当前 output channel 方向的起始行：
+uint32_t localOffsetWeightY = h * 256 + hh * 32;
+含义是：
+
+- h * 256：当前 work-group 负责的 256 个 output channel block
+- hh * 32：当前 work-item 负责其中的 32 个 output channel
+所以这一行加载的是：
+weights[localOffsetWeightY : localOffsetWeightY + 31]
+       [localOffsetWeightX : localOffsetWeightX + 3 uint32]
+也就是：
+32 个 output channel
+每个 channel 读取 32 个 Q4 K values
+true, false 的作用
+true
+表示做 transpose 式的 2D load。也就是说，内存中是按：
+output channel 行
+K packed 列
+存的，但加载到 SIMD register 后，会按更适合后续 dpas/shuffle 的顺序排列。
+false
+表示不做额外 transform，比如不做 VNNI transform。这里只有普通 2D load + transpose。
+这行最终实现的功能
+它从 packed Q4 weight 矩阵中取出一个 tile：
+32 output channels x 32 K values
+因为 Q4 packed，所以实际读：
+32 行 x 16 bytes = 512 bytes
+读完后放进：
+simd<uint8_t, 512> BData
+后面再拆成低 4bit 和高 4bit：
+BData0_tik = BData0 & 0x0f; // low nibble
+BData0_tok = BData0 >> 4;   // high nibble
+然后乘 scale/zp，转成 fp16，送进：
+xmx::dpas(...)
+一句话：  
+这行就是 从 Q4 packed weight 矩阵中按 2D tile 方式高效加载当前 work-item 需要的 32x32 weight block，并重排成后续 XMX dpas 更容易消费的 SIMD 布局。
+
+
+
+	load_2d<
+	T,
+	BlockWidth,
+	BlockHeight,
+	NBlocks,
+	Transposed,
+	Transformed>
+	(
+	base,
+	surface_width_minus_1,
+	surface_height_minus_1,
+	surface_pitch_minus_1,
+	x,
+	y
+	)
+
+
+>对应这里：
+>load_2d<uint32_t, 4, 32, 1, true, false>(
+>(uint32_t *)weights,
+>input_len/2 - 1,
+>output_len - 1,
+>input_len/2 - 1,
+>localOffsetWeightX,
+>localOffsetWeightY);
+>模板参数
+>uint32_t
+>表示这次 load 的元素类型。返回值逻辑上是 simd<uint32_t, 4 * 32 * 1>，也就是 128 个 uint32_t。
+>4
+>BlockWidth，每一行读取 4 个 uint32_t。
+>注意这里是以 T 为单位，不是 4 bytes。因为 T = uint32_t，所以实际每行读取：
+>4 * sizeof(uint32_t) = 16 bytes
+>对 Q4 weight 来说，16 bytes = 32 个 4bit weight。
+>32
+>BlockHeight，读取 32 行。
+>这里每一行对应一个 output channel，所以是一次读取 32 个 output channel。
+>1
+>NBlocks，读取几个这样的 2D block。这里是 1，所以只取一个 4 x 32 的 block。
+>true
+>Transposed，表示 load 回来的寄存器布局做转置式排列。
+>内存里是二维：
+>row = output channel
+>col = packed K
+>正常 load 的自然顺序类似：
+>row0 col0..3
+>row1 col0..3
+>...
+>row31 col0..3
+>Transposed = true 后，寄存器里会变成更适合后续 SIMD/XMX 使用的顺序。它不改变全局内存，只改变 load 到 simd 里的元素排列。
+>false
+>Transformed，表示不启用额外的数据 transform。常见 transform 是给 VNNI/DPAS 准备的特殊格式变换。这里已经自己在后面用 select、& 0x0f、>> 4 做 Q4 unpack/reorder，所以这里不让硬件额外 transform。
+>运行时参数
+>(uint32_t *)weights
+>base pointer。2D surface 的起始地址。
+>虽然原始 weights 是 uint8_t*，这里 cast 成 uint32_t*，是因为这次 load 以 uint32_t 为元素单位读取。
+>input_len/2 - 1
+>这是 surface_width_minus_1。
+>它告诉 load_2d：这个 2D surface 每一行的有效宽度是多少。
+>因为 Q4 weight 是 4bit，一个 byte 存两个 K，所以一行实际 byte 数是：
+>input_len / 2
+>API 要求传 width - 1，所以是：
+>input_len / 2 - 1
+>它具体干嘛用？
+>主要有三件事：
+1. 定义一行的合法访问范围。
+2. 帮硬件判断 x + block_width 是否越过 surface 右边界。
+3. 和 surface_pitch 一起构造 2D block load 的地址描述符。
+它不是简单地参与 C++ 指针加法，而是作为硬件 2D load 的 descriptor 参数。
+output_len - 1
+这是 surface_height_minus_1。
+它告诉硬件这个 surface 有多少行。这里一行是一个 output channel，所以高度是 output_len。
+同样 API 要求传 height - 1。
+input_len/2 - 1
+这是 surface_pitch_minus_1。
+pitch 是相邻两行之间的跨度。这里 weight 是紧密排列的：
+weights[output_channel][packed_k]
+每个 output channel 一行，每行 input_len / 2 bytes，所以 pitch 也是：
+input_len / 2
+API 要求 pitch - 1，所以传：
+input_len/2 - 1
+它具体干嘛用？
+硬件读取第 r 行时，会类似这样算地址：
+row_base = base + (y + r) * pitch
+addr     = row_base + x
+所以 surface_pitch_minus_1 决定了从一行跳到下一行要跨多少 bytes。
+localOffsetWeightX
+这是 2D load 的 X 坐标，也就是从每一行的哪个位置开始读。
+这里每次读取 4 个 uint32_t：
+4 uint32_t = 16 bytes = 32 个 Q4 weight
+所以 loop 里每轮：
+localOffsetWeightX += 4;
+表示 K 方向向后移动 32 个 Q4 元素。
+localOffsetWeightY
+这是 2D load 的 Y 坐标，也就是从第几个 output channel 行开始读。
+localOffsetWeightY = h * 256 + hh * 32;
+含义是当前 work-item 读取当前 output block 内的 32 行。
+这行整体做的事
+它让硬件从 weights 这个二维 surface 中读取：
+起点: (x = localOffsetWeightX, y = localOffsetWeightY)
+
+范围:
+32 行
+每行 4 个 uint32_t
+也就是：
+32 output channels x 16 bytes
+= 32 output channels x 32 个 Q4 weight
+= 512 bytes
+然后把这 512 bytes 放进 BData：
+simd<uint8_t, 512> BData;
+左边用：
+BData.bit_cast_view<uint32_t>()
+只是为了用 simd<uint32_t, 128> 的视角接住 load_2d 返回值。底层还是同一组 512 bytes。
