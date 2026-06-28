@@ -1,4 +1,4 @@
-size_t getScratchBufferSize_gemm(uint32_t maxBatch, uint32_t contextLen, uint32_t maxHidden)
+size_t getScratchBufferSize_gemm_q41(uint32_t maxBatch, uint32_t contextLen, uint32_t maxHidden)
 {
-    return maxBatch * maxHidden * 2 / 64 * 66 + 4096;
+    return (maxBatch * maxHidden) * sizeof(fp16) + 64 * maxHidden * sizeof(float);
 }

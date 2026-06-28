@@ -1,3 +1,10 @@
+
+
+
+
+
+
+
 void shuffle_Q41Weights_group32_L3(uint8_t* input, uint8_t* output, uint32_t input_len, uint32_t output_len)
 {
     typedef struct {
@@ -36,6 +43,40 @@ void shuffle_Q41Weights_group32_L3(uint8_t* input, uint8_t* output, uint32_t inp
         }
 
     }
+}
+
+
+
+
+void shuffle_swiglu_Q41Weights_group32_L3(uint8_t* input, uint8_t* output, uint32_t input_len, uint32_t output_len)
+{
+    typedef struct {
+        union {
+            struct {
+                sycl::half d; // delta
+                sycl::half m; // min
+            };
+            uint32_t dm;
+        };
+        uint8_t qs[32 / 2]; // nibbles / quants for 32 elements
+    } block_q4_1_32;
+
+    uint8_t *temp = new uint8_t[(input_len / 32) * output_len * sizeof(block_q4_1_32)];
+
+    uint32_t copy_block_size = 16 * (input_len/32) * sizeof(block_q4_1_32);
+    uint32_t gate_offset = (output_len / 2) * (input_len / 32) * sizeof(block_q4_1_32);
+
+    uint32_t num_block = output_len / 2 / 16;
+
+    for (int j = 0; j < num_block; j++)
+    {
+        memcpy(temp + j * 2 * copy_block_size, input + j * copy_block_size, copy_block_size);
+        memcpy(temp + (j * 2 + 1 ) * copy_block_size, input + gate_offset + j * copy_block_size, copy_block_size);
+    }
+
+    shuffle_Q41Weights_group32_L3(temp, output, input_len, output_len);
+
+    delete[] temp;
 }
 
 
@@ -86,7 +127,8 @@ void shuffle_Q41Weights_group32_L5(uint8_t* input, uint8_t* output, uint32_t inp
 }
 
 
-void shuffle_Q41Weights_group32_L1(uint8_t* input, uint8_t* output, uint32_t input_len, uint32_t output_len)
+
+void shuffle_swiglu_Q41Weights_group32_L5(uint8_t* input, uint8_t* output, uint32_t input_len, uint32_t output_len)
 {
     typedef struct {
         union {
@@ -99,17 +141,20 @@ void shuffle_Q41Weights_group32_L1(uint8_t* input, uint8_t* output, uint32_t inp
         uint8_t qs[32 / 2]; // nibbles / quants for 32 elements
     } block_q4_1_32;
 
-    block_q4_1_32* t = (block_q4_1_32*)input;
-    uint8_t* p = (uint8_t *)output;
-    sycl::half* h = (sycl::half*)(p + input_len * output_len / 2);
-    sycl::half* z = (sycl::half*)(p + input_len * output_len / 2 + input_len * output_len / 32 * sizeof(sycl::half));
+    uint8_t *temp = new uint8_t[(input_len / 32) * output_len * sizeof(block_q4_1_32)];
 
-    for (int i = 0; i < input_len * output_len / 32; i++)
+    uint32_t copy_block_size = 16 * (input_len/32) * sizeof(block_q4_1_32);
+    uint32_t gate_offset = (output_len / 2) * (input_len / 32) * sizeof(block_q4_1_32);
+
+    uint32_t num_block = output_len / 2 / 16;
+
+    for (int j = 0; j < num_block; j++)
     {
-        memcpy(p, t[i].qs, 32 / 2);
-        p += (32 / 2);
-
-        h[i] = t[i].d;
-        z[i] = t[i].m;
+        memcpy(temp + j * 2 * copy_block_size, input + j * copy_block_size, copy_block_size);
+        memcpy(temp + (j * 2 + 1 ) * copy_block_size, input + gate_offset + j * copy_block_size, copy_block_size);
     }
+
+    shuffle_Q41Weights_group32_L5(temp, output, input_len, output_len);
+
+    delete[] temp;
 }
