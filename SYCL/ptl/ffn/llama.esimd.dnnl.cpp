@@ -31,6 +31,8 @@ using namespace sycl::ext::intel::esimd;
 #define GROUP_SIZE 128
 
 extern "C" size_t __declspec(dllexport) getScratchBufferSize_gemm(uint32_t maxBatch, uint32_t contextLen, uint32_t maxHidden);
+extern "C" bool __declspec(dllexport) runGemm_Q40Weights_L2(sycl::queue* q, uint8_t* inputs, uint8_t* weights, uint8_t* scales, uint8_t* outputs, unsigned batch, unsigned input_len, unsigned output_len, unsigned input_precision, unsigned output_precision,  uint8_t* shuffleTt);
+extern "C" void __declspec(dllexport) shuffle_Q40Weights_group128_L2(uint8_t* input, uint8_t* output, uint32_t input_len, uint32_t output_len);
 
 extern "C" bool __declspec(dllexport) runFfnFusion_dnnl(sycl::queue* q, uint8_t * up, uint8_t * gate, uint8_t * down, uint8_t * input, uint8_t * output, uint32_t token_len, uint32_t input_len, uint32_t hidden_len, uint8_t* shuffleTt);
 extern "C" size_t __declspec(dllexport) getScratchBufferSize_ffn(uint32_t maxBatch, uint32_t contextLen, uint32_t maxHidden);
@@ -118,10 +120,117 @@ private:
 
 };
 
+void shuffle_Q40Weights_group128_L2(uint8_t* input, uint8_t* output, uint32_t input_len, uint32_t output_len)
+{
+    typedef struct {
+        sycl::half d;           // delta
+        uint8_t qs[128 / 2]; // nibbles / quants
+    } block_q4_0;
+    block_q4_0* t = (block_q4_0*)input;
+    char* p = (char *)output;
+    sycl::half* h = (sycl::half*)(p + input_len * output_len / 2);
+
+    for (int i = 0; i < input_len * output_len / 128; i++)
+    {
+        //memcpy(p, t[i].qs, QK4_0 / 2);
+        for (int j = 0; j < 128 / 2; j += 16)
+        {
+            int8_t shuffle[32];
+            for (int k = 0; k < 16; k++)
+            {
+                uint8_t hi = t[i].qs[j + k] >> 4;
+                uint8_t lo = t[i].qs[j + k] & 0x0f;
+                shuffle[k] = lo - 8;
+                shuffle[k + 16] = hi - 8;
+            }
+
+            for (int k = 0; k < 16; k++)
+            {
+                p[j + k] = ((shuffle[2 * k + 1] & 0x0f) << 4) | (shuffle[2 * k] & 0x0f);
+            }
+        }
+
+        p += (128 / 2);
+
+        int vv = i / (input_len / 128);
+        int hh = i % (input_len / 128);
+        h[hh * output_len + vv] = t[i].d;
+    }
+
+}
 
 size_t getScratchBufferSize_gemm(uint32_t maxBatch, uint32_t contextLen, uint32_t maxHidden)
 {
     return maxBatch * maxHidden * sizeof(fp16);
+}
+
+bool runGemm_Q40Weights_L2(sycl::queue* q, uint8_t* inputs, uint8_t* weights, uint8_t* scales, uint8_t* outputs, unsigned batch, unsigned input_len, unsigned output_len, unsigned input_precision, unsigned output_precision,  uint8_t* shuffleTt)
+{
+    const int64_t M = batch;
+    const int64_t N = output_len;
+    const int64_t K = input_len;
+
+    int64_t G = K / GROUP_SIZE;
+
+    //dnnl::engine eng = dnnl::sycl_interop::make_engine(q.get_device(), q.get_context());
+    dnnl::engine eng = MatMulPremitiveMgr::Instance().Engine(q);
+    dnnl::stream s = dnnl::sycl_interop::make_stream(eng, *q);
+
+    dnnl::memory::data_type dt = (output_precision == 1) ? dnnl::memory::data_type::f16 : dnnl::memory::data_type::f32;
+    dnnl::memory::desc src_f32_desc = dnnl::memory::desc({ M, K }, dnnl::memory::data_type::f32, { K, 1 });
+    dnnl::memory::desc src_f16_desc = dnnl::memory::desc({ M, K }, dnnl::memory::data_type::f16, { K, 1 });
+    dnnl::memory::desc weights_desc = dnnl::memory::desc({ K, N }, dnnl::memory::data_type::s4, dnnl::memory::format_tag::ba);
+    dnnl::memory::desc dst_desc = dnnl::memory::desc({ M, N }, dt, { N, 1 });
+    dnnl::memory::desc scale_f16_desc = dnnl::memory::desc({ G, N }, dnnl::memory::data_type::f16, { N, 1 });
+
+    //dnnl::primitive_attr attr;
+    //attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) + (1 << 1), { GROUP_SIZE, 1 }, dnnl::memory::data_type::f16);
+    //attr.set_zero_points(DNNL_ARG_WEIGHTS, (1 << 0) + (1 << 1), { GROUP_SIZE, 1 }, dnnl::memory::data_type::u8);
+    //attr.set_fpmath_mode(dnnl::fpmath_mode::f16, true);
+    //// Create primitive descriptor.
+    //auto matmul_pd = dnnl::matmul::primitive_desc(eng, src_f16_desc, weights_desc, dst_f32_desc, attr);
+    //// Create the primitive.
+    //// TODO: this step may take long time
+    //auto matmul_prim = dnnl::matmul(matmul_pd);
+
+    dnnl::matmul matmul_prim = MatMulPremitiveMgr::Instance().Get(M, K, N, output_precision, eng);
+
+    dnnl::memory src_fp16_mem;
+    dnnl::memory weights_mem = dnnl::memory(weights_desc, eng, weights);
+    dnnl::memory dst_mem = dnnl::memory(dst_desc, eng, outputs);
+    dnnl::memory scale_fp16_mem = dnnl::memory(scale_f16_desc, eng, scales);
+
+    //s.wait();
+    //auto start = std::chrono::steady_clock::now();
+
+    if (input_precision == 0) //fp32
+    {
+        dnnl::memory src_fp32_mem = dnnl::memory(src_f32_desc, eng, inputs);
+        src_fp16_mem = dnnl::memory(src_f16_desc, eng, shuffleTt);
+        dnnl::reorder(src_fp32_mem, src_fp16_mem).execute(s, src_fp32_mem, src_fp16_mem);
+    }
+    else
+    {
+        src_fp16_mem = dnnl::memory(src_f16_desc, eng, inputs);
+    }
+    // create GEMM primitative and excute
+    std::unordered_map<int, dnnl::memory> args = {
+        {DNNL_ARG_SRC, src_fp16_mem},
+        {DNNL_ARG_WEIGHTS, weights_mem},
+        {DNNL_ARG_DST, dst_mem},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scale_fp16_mem},
+    };
+
+    matmul_prim.execute(s, args);
+    //s.wait();
+
+    //auto end = std::chrono::steady_clock::now();
+    //double dur = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+    //printf("GEMM of (%d x %d) x (%d x %d) takes %f us\n", M, K, K, N, dur);
+
+
+    return true;
 }
 
 size_t getScratchBufferSize_ffn(uint32_t maxBatch, uint32_t contextLen, uint32_t maxHidden)
@@ -176,6 +285,35 @@ bool runSiluAndMultiply(sycl::queue& q, sycl::half* gate_result, sycl::half* up_
     }
 }
 
+// void dump(sycl::queue*q, uint8_t *data, uint32_t size, const char* filename)
+// {
+//     q->wait();
+//     uint8_t *temp = new uint8_t[size];
+//     q->memcpy(temp, data, size).wait();
+//     FILE *fp = nullptr;
+//     fopen_s(&fp, filename, "wb");
+//     fwrite(temp, 1, size, fp);
+//     fclose(fp);
+//     delete[] temp;
+// }
+
+bool runFfnFusion_dnnl(sycl::queue* q, uint8_t * up, uint8_t * gate, uint8_t * down, uint8_t * input, uint8_t * output, uint32_t token_len, uint32_t input_len, uint32_t hidden_len, uint8_t* shuffleTt)
+{
+    uint8_t *up_output = shuffleTt + token_len * hidden_len * sizeof(sycl::half);
+    uint8_t *gate_output = shuffleTt + token_len * hidden_len * sizeof(sycl::half) + token_len * hidden_len * sizeof(sycl::half);
+
+    dnnl::engine eng = MatMulPremitiveMgr::Instance().Engine(q);
+    dnnl::stream s = dnnl::sycl_interop::make_stream(eng, *q);
+
+    runGemm_Q40Weights_L2(q, input, up, up + input_len*hidden_len/2, up_output, token_len, input_len, hidden_len, 0, 1, shuffleTt);
+    runGemm_Q40Weights_L2(q, shuffleTt, gate, gate + input_len*hidden_len/2, gate_output, token_len, input_len, hidden_len, 1, 1, nullptr);
+    runSiluAndMultiply(*q, (sycl::half *)gate_output, (sycl::half *)up_output, (sycl::half *)gate_output,  token_len, hidden_len );
+    runGemm_Q40Weights_L2(q, gate_output, down, down + input_len*hidden_len/2, output, token_len, hidden_len, input_len, 1, 0, nullptr);
+
+
+    return true;
+
+}
 
 size_t getVisionScratchBufferSize_gemm(uint32_t maxBatch, uint32_t head_num, uint32_t maxHidden)
 {
